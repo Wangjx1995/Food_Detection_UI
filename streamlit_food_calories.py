@@ -1,4 +1,4 @@
-# streamlit_food_calories.py
+# streamlit_food_calories.py (Colab 一键公网隧道版)
 # ---------------------------------
 # Minimal Streamlit page for food-calorie demo (fixed 4 classes):
 # Classes: bread / jelly / riceball / instant noodle
@@ -7,16 +7,91 @@
 # - Front-end table for per-class calories (kcal per item)
 # - Compute & display total calories (count × per-class kcal)
 #
-# Run:
-#   pip install -U ultralytics streamlit opencv-python pillow pandas
-#   streamlit run streamlit_food_calories.py
+# Colab 一键运行：
+#   1) 可选安装（若环境未装）:
+#        !pip -q install -U ultralytics streamlit opencv-python pillow pandas
+#   2) 直接运行：
+#        !streamlit run streamlit_food_calories.py
+#   本脚本会在首次运行时自动下载并启动 cloudflared 隧道，
+#   并在 Colab 的输出里打印公网地址，同时在应用侧边栏显示可点击链接。
 
+import os
+import re
 import cv2
+import time
+import shutil
+import threading
+import subprocess
+import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
 from ultralytics import YOLO
 
+# ---------------- Cloudflared 隧道（自动下载 & 启动） ---------------- #
+PORT = int(os.environ.get("STREAMLIT_SERVER_PORT", os.environ.get("PORT", "8501")))
+
+@st.cache_resource(show_spinner=False)
+def _ensure_cloudflared(bin_hint: str = "/usr/local/bin/cloudflared") -> str:
+    """确保 cloudflared 可用，不在则下载到 /usr/local/bin 或当前目录。返回可执行路径。"""
+    candidates = [bin_hint, "/usr/bin/cloudflared", "./cloudflared"]
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+    dest = bin_hint
+    try:
+        urllib.request.urlretrieve(url, dest)
+        os.chmod(dest, 0o755)
+        return dest
+    except Exception:
+        # 无权限写入 /usr/local/bin 时，退回到当前目录
+        alt = "./cloudflared"
+        urllib.request.urlretrieve(url, alt)
+        os.chmod(alt, 0o755)
+        return os.path.abspath(alt)
+
+@st.cache_resource(show_spinner=False)
+def _start_cloudflared(port: int) -> str:
+    """启动 cloudflared 隧道，返回公网 URL（可能为空字符串，表示仍在获取）。"""
+    # 尽量清理旧进程（忽略错误）
+    try:
+        subprocess.run(["pkill", "-f", "cloudflared"], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    bin_path = _ensure_cloudflared()
+    url_pat = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+    url_holder = {"url": ""}
+
+    def _reader():
+        # --no-autoupdate 避免自动升级卡住；stdout 合并方便解析
+        proc = subprocess.Popen(
+            [bin_path, "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        # 把 PID 放到 session 里，方便后续清理
+        st.session_state["__cf_pid__"] = proc.pid
+        for line in proc.stdout:  # 持续读取，避免管道阻塞
+            m = url_pat.search(line)
+            if m and not url_holder["url"]:
+                url_holder["url"] = m.group(0)
+                # 打印到控制台（Colab 单元格里可见）
+                print("🌍 Public URL:", url_holder["url"], flush=True)
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    # 等待最多 ~20s 获取 URL（UI 侧会继续显示占位提示）
+    for _ in range(80):
+        if url_holder["url"]:
+            break
+        time.sleep(0.25)
+    return url_holder["url"]
+
+PUBLIC_URL = _start_cloudflared(PORT)
+
+# ---------------- App 基本设置 ---------------- #
 TARGET_CLASSES = ["bread", "jelly", "riceball", "instant noodle"]
 
 st.set_page_config(page_title="Food Calories (YOLO11)", layout="wide")
@@ -26,11 +101,21 @@ st.set_page_config(page_title="Food Calories (YOLO11)", layout="wide")
 def load_model(weights_path: str):
     return YOLO(weights_path)
 
-# ---------- UI ----------
+# ---------- 顶部标题 ----------
 st.title("🍽️ 食物总卡路里估算 — YOLO11（固定四类）")
-st.caption("上传一张图片；固定类别：bread / jelly / riceball / instant noodle。前端设置每类每份卡路里，按检测\"数量×单份卡路里\"累计总量。")
+st.caption(
+    "上传一张图片；固定类别：bread / jelly / riceball / instant noodle。前端设置每类每份卡路里，按检测\"数量×单份卡路里\"累计总量。"
+)
 
 with st.sidebar:
+    st.header("公网访问")
+    if PUBLIC_URL:
+        st.success("已创建 Cloudflare 隧道")
+        st.markdown(f"**公网地址：** [{PUBLIC_URL}]({PUBLIC_URL})")
+        st.code(PUBLIC_URL)
+    else:
+        st.info("正在申请公网地址（Cloudflare 隧道）… 若长时间无响应，可重启或重新运行脚本。")
+
     st.header("模型与推理")
     weights = st.text_input("模型权重路径", value="yolo11n.pt", help="建议换成你的自训权重，例如 runs/detect/train/weights/best.pt")
     conf = st.slider("置信度 (conf)", 0.0, 1.0, 0.25, 0.01)
