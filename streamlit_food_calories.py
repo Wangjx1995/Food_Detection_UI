@@ -1,61 +1,106 @@
-# streamlit_food_calories.py (Colab 一键公网隧道版・日本語 UI・predict.py 連携)
+# streamlit_food_calories.py (Cross-platform Cloudflared・日本語 UI・predict.py 連携・公開URLを実行結果に表示)
 # ---------------------------------
 # 固定4クラス: bread / jelly / riceball / instant noodle
 # - 画像アップロード
 # - 同一フォルダの predict.py の predict() を直接呼び出し
 # - 1個あたりカロリーをフロントで設定 → 総カロリー算出
 # - 検出ボックス (xyxy) 表示 + JSON（ダウンロードなし）
+# - Cloudflared を自動DL & 起動（Win/macOS/Linux/Colab 対応）
+# - 起動時に 公開URL を コンソールとページ本文 に即表示
 
 import os
 import re
 import cv2
 import time
+import json
+import platform
+import tarfile
+import tempfile
+import shutil
 import threading
 import subprocess
 import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
-import json  # JSON 表示用
 
-# ★ 同一フォルダの predict.py を使用（あなたの貼った実装を呼び出します）
+# ★ 同一フォルダの predict.py を使用（あなたの実装を呼び出します）
 from predict import predict as run_predict
 from ultralytics import YOLO  # 構成維持のため残しています（推論は run_predict を使用）
 
-# ---------------- Cloudflared トンネル（自動DL & 起動） ---------------- #
+# ---------------- Cloudflared トンネル（自動DL & 起動・クロスプラットフォーム） ---------------- #
 PORT = int(os.environ.get("STREAMLIT_SERVER_PORT", os.environ.get("PORT", "8501")))
 
 @st.cache_resource(show_spinner=False)
-def _ensure_cloudflared(bin_hint: str = "/usr/local/bin/cloudflared") -> str:
-    """cloudflared を用意（無ければDL）。返り値は実行パス。"""
-    candidates = [bin_hint, "/usr/bin/cloudflared", "./cloudflared"]
+def _ensure_cloudflared() -> str:
+    """
+    Cross-platform downloader for cloudflared.
+    Returns absolute path to the executable (cloudflared or cloudflared.exe).
+    """
+    candidates = [
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+        os.path.abspath("./cloudflared"),
+        os.path.abspath("./cloudflared.exe"),
+    ]
     for p in candidates:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
-    url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    dest = bin_hint
-    try:
+
+    sys = platform.system().lower()
+    arch = platform.machine().lower()
+
+    # Windows
+    if sys == "windows":
+        asset = "cloudflared-windows-amd64.exe" if ("64" in arch or "x86_64" in arch or "amd64" in arch) else "cloudflared-windows-arm64.exe"
+        url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+        dest = os.path.abspath("./cloudflared.exe")
         urllib.request.urlretrieve(url, dest)
         os.chmod(dest, 0o755)
         return dest
-    except Exception:
-        alt = "./cloudflared"
-        urllib.request.urlretrieve(url, alt)
-        os.chmod(alt, 0o755)
-        return os.path.abspath(alt)
+
+    # macOS
+    if sys == "darwin":
+        tar_asset = "cloudflared-darwin-amd64.tgz" if ("x86_64" in arch or "amd64" in arch) else "cloudflared-darwin-arm64.tgz"
+        url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{tar_asset}"
+        with tempfile.TemporaryDirectory() as td:
+            tgz = os.path.join(td, "cloudflared.tgz")
+            urllib.request.urlretrieve(url, tgz)
+            with tarfile.open(tgz, "r:gz") as tf:
+                tf.extractall(td)
+            extracted = os.path.join(td, "cloudflared")
+            dest = os.path.abspath("./cloudflared")
+            shutil.move(extracted, dest)
+            os.chmod(dest, 0o755)
+            return dest
+
+    # Linux
+    asset = "cloudflared-linux-amd64" if ("x86_64" in arch or "amd64" in arch) else "cloudflared-linux-arm64"
+    url = f"https://github.com/cloudflare/cloudflared/releases/latest/download/{asset}"
+    dest = os.path.abspath("./cloudflared")
+    urllib.request.urlretrieve(url, dest)
+    os.chmod(dest, 0o755)
+    return dest
+
 
 @st.cache_resource(show_spinner=False)
 def _start_cloudflared(port: int) -> str:
-    """トンネル起動し、公開URLを返す（取れなければ空文字）。"""
+    """
+    Start cloudflared tunnel to http://localhost:{port} and return public URL.
+    """
+    # 旧プロセスを可能な範囲で終了
     try:
-        subprocess.run(["pkill", "-f", "cloudflared"], check=False,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if platform.system().lower() == "windows":
+            subprocess.run(["taskkill", "/F", "/IM", "cloudflared.exe", "/T"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["pkill", "-f", "cloudflared"], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except Exception:
         pass
 
     bin_path = _ensure_cloudflared()
-    import re as _re
-    url_pat = _re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
+    url_pat = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com")
     url_holder = {"url": ""}
 
     def _reader():
@@ -64,13 +109,16 @@ def _start_cloudflared(port: int) -> str:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
         st.session_state["__cf_pid__"] = proc.pid
-        for line in proc.stdout:
+        for line in proc.stdout or []:
             m = url_pat.search(line)
             if m and not url_holder["url"]:
                 url_holder["url"] = m.group(0)
-                print("🌍 Public URL:", url_holder["url"], flush=True)
+                # コンソールに即出力（ノートブック/ターミナルで直接コピー可）
+                print(url_holder["url"], flush=True)
 
     threading.Thread(target=_reader, daemon=True).start()
+
+    # 最大 ~20 秒待機
     for _ in range(80):
         if url_holder["url"]:
             break
@@ -78,6 +126,9 @@ def _start_cloudflared(port: int) -> str:
     return url_holder["url"]
 
 PUBLIC_URL = _start_cloudflared(PORT)
+# 起動直後にももう一度コンソール出力（念のため）
+if PUBLIC_URL:
+    print(PUBLIC_URL, flush=True)
 
 # ---------------- App 基本設定 ---------------- #
 TARGET_CLASSES = ["bread", "jelly", "riceball", "instant noodle"]
@@ -91,7 +142,6 @@ DEFAULT_WEIGHTS = os.path.join(HERE, "best.pt")
 @st.cache_resource(show_spinner=False)
 def load_model(weights_path: str):
     # 構成維持のために置いてあります（実推論は run_predict を使用）
-    # best.pt が無い環境でもアプリが落ちないように try/except
     try:
         if os.path.exists(weights_path):
             return YOLO(weights_path)
@@ -101,6 +151,11 @@ def load_model(weights_path: str):
 
 # ---------- ヘッダー（日本語） ----------
 st.title("🍽️ 画像内総カロリー推定 — YOLO11（固定4クラス）")
+# 本文にも公開URLを即表示（存在する場合）
+if PUBLIC_URL:
+    st.success(f"公開URL：{PUBLIC_URL}")
+    st.code(PUBLIC_URL)
+
 st.caption(
     "画像をアップロードしてください。対象クラスは固定：bread / jelly / riceball / instant noodle。"
     "フロントで各クラスの1個あたりカロリーを設定し、検出数×単価で総カロリーを算出します。"
