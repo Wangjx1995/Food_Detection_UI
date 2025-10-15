@@ -1,12 +1,13 @@
-# streamlit_food_calories.py (Cross-platform Cloudflared・日本語 UI・predict.py 連携・公開URLを実行結果に表示)
-# ---------------------------------
+# streamlit_food_calories.py
+# Cross-platform Cloudflared・日本語 UI・predict.py 連携・公開URLを実行結果に表示
+# -------------------------------------------------------------------
 # 固定4クラス: bread / jelly / riceball / instant noodle
 # - 画像アップロード
 # - 同一フォルダの predict.py の predict() を直接呼び出し
 # - 1個あたりカロリーをフロントで設定 → 総カロリー算出
 # - 検出ボックス (xyxy) 表示 + JSON（ダウンロードなし）
 # - Cloudflared を自動DL & 起動（Win/macOS/Linux/Colab 対応）
-# - 起動時に 公開URL を コンソールとページ本文 に即表示
+# - 起動時に 公開URL を コンソールとページ本文 に即表示＆public_url.txt に保存
 
 import os
 import re
@@ -24,12 +25,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# ---- Streamlit ページ設定（最初に呼ぶのが推奨）----
+st.set_page_config(page_title="Food Calories (YOLO11)", layout="wide")
+
 # ★ 同一フォルダの predict.py を使用（あなたの実装を呼び出します）
 from predict import predict as run_predict
 from ultralytics import YOLO  # 構成維持のため残しています（推論は run_predict を使用）
 
-# ---------------- Cloudflared トンネル（自動DL & 起動・クロスプラットフォーム） ---------------- #
+# ===== Cloudflared（クロスプラットフォーム）=====
 PORT = int(os.environ.get("STREAMLIT_SERVER_PORT", os.environ.get("PORT", "8501")))
+URL_FILE = os.path.abspath("./public_url.txt")  # 公開URLの保存先
 
 @st.cache_resource(show_spinner=False)
 def _ensure_cloudflared() -> str:
@@ -108,13 +113,20 @@ def _start_cloudflared(port: int) -> str:
             [bin_path, "tunnel", "--url", f"http://localhost:{port}", "--no-autoupdate"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
         )
-        st.session_state["__cf_pid__"] = proc.pid
+        # 読み取りループ
         for line in proc.stdout or []:
             m = url_pat.search(line)
             if m and not url_holder["url"]:
                 url_holder["url"] = m.group(0)
-                # コンソールに即出力（ノートブック/ターミナルで直接コピー可）
+                # ① コンソール（Colabセル出力）に即出力
                 print(url_holder["url"], flush=True)
+                # ② ファイルにも保存（バックアップ）
+                try:
+                    with open(URL_FILE, "w", encoding="utf-8") as f:
+                        f.write(url_holder["url"])
+                except Exception:
+                    pass
+                break
 
     threading.Thread(target=_reader, daemon=True).start()
 
@@ -126,14 +138,12 @@ def _start_cloudflared(port: int) -> str:
     return url_holder["url"]
 
 PUBLIC_URL = _start_cloudflared(PORT)
-# 起動直後にももう一度コンソール出力（念のため）
+# 起動直後にも再出力（保険）
 if PUBLIC_URL:
     print(PUBLIC_URL, flush=True)
 
-# ---------------- App 基本設定 ---------------- #
+# ---------------- アプリ基本設定 ---------------- #
 TARGET_CLASSES = ["bread", "jelly", "riceball", "instant noodle"]
-
-st.set_page_config(page_title="Food Calories (YOLO11)", layout="wide")
 
 # ★ 同一ディレクトリの best.pt を固定で使用（表示のみ、入力不可）
 HERE = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
@@ -151,6 +161,7 @@ def load_model(weights_path: str):
 
 # ---------- ヘッダー（日本語） ----------
 st.title("🍽️ 画像内総カロリー推定 — YOLO11（固定4クラス）")
+
 # 本文にも公開URLを即表示（存在する場合）
 if PUBLIC_URL:
     st.success(f"公開URL：{PUBLIC_URL}")
@@ -237,6 +248,7 @@ if up is not None:
 
         # 固定4クラスに限定
         if not det_df.empty:
+            det_df = det_df[det_df["class_name"]].isin(TARGET_CLASSES)
             det_df = det_df[det_df["class_name"].isin(TARGET_CLASSES)].reset_index(drop=True)
 
         if det_df.empty:
