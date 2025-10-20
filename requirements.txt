@@ -1,10 +1,8 @@
 streamlit==1.37.1
 ultralytics==8.2.103
-opencv-python-headless==4.10.0.84
 pillow==10.4.0
 pandas==2.2.2
 
-# 只给“额外索引”，其他包仍走 PyPI；并且用与 Py3.11 兼容的一组版本
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.4.1+cpu
 torchvision==0.19.1+cpu
